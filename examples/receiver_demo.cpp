@@ -6,14 +6,18 @@
 // 只需包含你的接收端实现和类型契约
 #include "../src/receiver/UdpReceiverImpl.h"
 
-int main() {
-    std::cout << "=== Receiver Demo Started ===" << std::endl;
+int main(int argc, char* argv[]) {
+    // 默认监听 8080，如果运行程序时传了参数，就用传入的端口
+    int port = 8080;
+    if (argc > 1) {
+        port = std::atoi(argv[1]);
+    }
 
-    // 1. 实例化接收端
+    std::cout << "=== Receiver Demo Started ===" << std::endl;
     UdpReceiverImpl receiver;
 
-    // 2. 初始化 (监听 8080 端口，期望分辨率 1280x1024 用于黑屏兜底)
-    if (!receiver.init(8080, 1280, 1024)) {
+    // 将写死的 8080 替换为变量 port
+    if (!receiver.init(port, 1280, 1024)) {
         std::cerr << "Receiver initialization failed!" << std::endl;
         return -1;
     }

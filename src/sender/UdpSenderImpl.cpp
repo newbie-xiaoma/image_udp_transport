@@ -2,6 +2,8 @@
 #include "../protocol/UdpHeader.h"
 #include <iostream>
 #include <cstring>
+#include <thread>
+#include <chrono>
 #include <arpa/inet.h> // 用于 htons (网络字节序转换)
 constexpr size_t UdpSenderImpl::MAX_PAYLOAD_SIZE;
 UdpSenderImpl::UdpSenderImpl() 
@@ -23,7 +25,7 @@ bool UdpSenderImpl::init(const char* remote_ip, int remote_port, int width, int 
     // 1. 初始化底层的 UDP 客户端
     // 这里传入 nullptr 作为网卡 interface，代表让操作系统自动路由
     udp_client_ = std::make_unique<UDPOperation>(remote_ip, remote_port, nullptr);
-    if (!udp_client_->create_client()) {
+    if (!udp_client_->create_server()) {
         std::cerr << "[Sender] Failed to create UDP client." << std::endl;
         return false;
     }
@@ -118,6 +120,8 @@ bool UdpSenderImpl::sendFrame(cv::Mat& img,
 
         // 4. 调用 UDPOperation 发送
         udp_client_->send_buffer(send_buffer.data(), packet_size);
+        // 5. 为了避免 UDP 包过快导致网络拥塞，这里可以稍微睡眠一下（根据实际情况调整）
+        std::this_thread::sleep_for(std::chrono::microseconds(100));
     }
 
     // ==========================================

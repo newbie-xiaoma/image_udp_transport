@@ -26,7 +26,7 @@ bool UdpReceiverImpl::init(int local_port, int width, int height) {
 
     // 1. 初始化 UDP 服务端 (监听 0.0.0.0 的指定端口)
     udp_server_ = std::make_unique<UDPOperation>("0.0.0.0", local_port, nullptr);
-    if (!udp_server_->create_server()) {
+    if (!udp_server_->create_client()) {
         std::cerr << "[Receiver] Failed to create UDP server on port " << local_port << std::endl;
         return false;
     }
