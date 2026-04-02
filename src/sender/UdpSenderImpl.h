@@ -2,26 +2,53 @@
 
 #include <memory>
 #include <string>
+#include <thread>
+#include <mutex>
+#include <condition_variable>
+#include <queue>
+#include <atomic>
 
-// 1. 继承第一阶段定义的纯虚接口
 #include "../../include/ImageSender.h"
-
-// 2. 引入底层的网络和硬件编解码库
 #include "../network/udp_operation.h"
-#include "img_codec.h" // 根据你的 CMake 包含路径调整
+#include "img_codec.h" 
+
+// 异步任务包结构
+struct SendTask {
+    cv::Mat img;
+    transport::WinInfo win;
+    std::vector<transport::Label> labels;
+    uint32_t quality;
+};
 
 class UdpSenderImpl : public ImageSender {
 public:
     UdpSenderImpl();
     ~UdpSenderImpl() override;
 
-    // 实现接口方法
     bool init(const char* remote_ip, int remote_port, int width, int height) override;
-    bool sendFrame(cv::Mat& img, 
-                   const transport::WinInfo& win, 
-                   const std::vector<transport::Label>& labels, 
-                   uint32_t quality) override;
+    
+    bool sendFrameSync(const cv::Mat& img, 
+                       const transport::WinInfo& win, 
+                       const std::vector<transport::Label>& labels, 
+                       uint32_t quality) override;
+
+    bool sendFrameAsync(const cv::Mat& img, 
+                        const transport::WinInfo& win, 
+                        const std::vector<transport::Label>& labels, 
+                        uint32_t quality) override;
+                   
     void stop() override;
+
+private:
+    void sendLoop();
+
+    // 核心底层干活函数：硬件编码 + 分片发送
+    // 参数 apply_pacing 决定是否使用平滑控流算法
+    bool internalEncodeAndSend(const cv::Mat& img, 
+                               const transport::WinInfo& win, 
+                               const std::vector<transport::Label>& labels, 
+                               uint32_t quality, 
+                               bool apply_pacing);
 
 private:
     std::unique_ptr<UDPOperation> udp_client_;
@@ -31,6 +58,18 @@ private:
     int img_height_;
     bool is_initialized_;
 
-    // 定义 UDP 包中载荷(Payload)的最大长度，保证总长度不超过常见局域网 MTU (1500)
     static constexpr size_t MAX_PAYLOAD_SIZE = 1024; 
+
+    // 硬件资源互斥锁：防止业务端同时调用 Sync 和 Async 导致底层 NPU Context 崩溃
+    std::mutex hardware_mutex_;
+
+    // === 异步核心组件 ===
+    std::queue<SendTask> task_queue_;
+    std::mutex queue_mutex_;
+    std::condition_variable queue_cv_;
+    
+    std::thread worker_thread_;
+    std::atomic<bool> running_;
+    
+    static constexpr size_t MAX_QUEUE_SIZE = 3; 
 };

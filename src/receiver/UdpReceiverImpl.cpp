@@ -3,78 +3,68 @@
 #include <iostream>
 #include <chrono>
 #include <cstring>
-#include <arpa/inet.h> // 用于 ntohs
 
 UdpReceiverImpl::UdpReceiverImpl() 
-    : img_width_(0), img_height_(0), running_(false) {
+    : running_(false), fallback_width_(1280), fallback_height_(1024) {
 }
 
 UdpReceiverImpl::~UdpReceiverImpl() {
     stop();
 }
 
-uint64_t UdpReceiverImpl::now_ms() {
+int64_t UdpReceiverImpl::now_ms() {
     return std::chrono::duration_cast<std::chrono::milliseconds>(
-        std::chrono::steady_clock::now().time_since_epoch()).count();
+        std::chrono::steady_clock::now().time_since_epoch()
+    ).count();
 }
 
-bool UdpReceiverImpl::init(int local_port, int width, int height) {
-    if (running_) return true;
+bool UdpReceiverImpl::init(int local_port, int fallback_w, int fallback_h) {
+    fallback_width_ = fallback_w;
+    fallback_height_ = fallback_h;
 
-    img_width_ = width;
-    img_height_ = height;
-
-    // 1. 初始化 UDP 服务端 (监听 0.0.0.0 的指定端口)
-    udp_server_ = std::make_unique<UDPOperation>("0.0.0.0", local_port, nullptr);
+    // 创建 UDP 监听客户端
+    udp_server_ = std::make_unique<UDPOperation>("0.0.0.0", local_port, "");
     if (!udp_server_->create_client()) {
-        std::cerr << "[Receiver] Failed to create UDP server on port " << local_port << std::endl;
+        std::cerr << "[Receiver] Failed to bind local port " << local_port << std::endl;
         return false;
     }
 
-    // 2. 初始化硬件 JPEG 解码器
-    decoder_ = std::make_unique<ImgDecode>(img_width_, img_height_);
+    // 初始化硬件解码器，直接通过构造函数传入分辨率参数
+    decoder_ = std::make_unique<ImgDecode>(fallback_width_, fallback_height_);
+    if (!decoder_) {
+        std::cerr << "[Receiver] HW Decoder init failed!" << std::endl;
+        return false;
+    }
 
-    // 3. 启动后台接收线程
     running_ = true;
+    
+    // 启动双线程流水线
     rx_thread_ = std::thread(&UdpReceiverImpl::receiveLoop, this);
+    decode_thread_ = std::thread(&UdpReceiverImpl::decodeLoop, this);
 
-    std::cout << "[Receiver] Initialized successfully. Listening on port: " << local_port << std::endl;
+    std::cout << "[Receiver] Async Dual-Thread Pipeline Initialized. Listening on port: " << local_port << std::endl;
     return true;
 }
 
+// 注意这里使用的是 OnFrameReceivedCallback
 void UdpReceiverImpl::registerCallback(OnFrameReceivedCallback callback) {
     callback_ = std::move(callback);
 }
 
-void UdpReceiverImpl::stop() {
-    running_ = false;
-    if (udp_server_) {
-        // 这一步是为了打破 recv_buffer 的阻塞
-        udp_server_->destory(); 
-    }
-    if (rx_thread_.joinable()) {
-        rx_thread_.join();
-    }
-    udp_server_.reset();
-    decoder_.reset();
-    rx_channels_.clear();
-}
-
+// ==========================================
+// 线程 1：极速网络收包线程 (Producer)
+// ==========================================
 void UdpReceiverImpl::receiveLoop() {
-    char buffer[2048]; // 足够容纳 MTU 1500 内的包
-    
+    char buffer[2048];
     while (running_) {
         int recv_len = udp_server_->recv_buffer(buffer, sizeof(buffer));
         if (recv_len <= 0) continue;
 
         auto* header = reinterpret_cast<protocol::UdpPacketHeader*>(buffer);
-        
-        // 1. 魔数校验：防御网络上的随机脏报文
         if (header->frame_head != protocol::PACKET_HEAD_MAGIC) continue;
         if (static_cast<uint8_t>(buffer[recv_len - 1]) != protocol::PACKET_TAIL_MAGIC) continue;
 
         uint8_t mode = header->win_mode;
-        // 🚨 必须使用 ntohs 把网络大端序转回本机的 CPU 字节序
         uint16_t packet_idx = ntohs(header->packet_idx);
         uint16_t total_packets = ntohs(header->total_packets);
         uint16_t payload_len = ntohs(header->payload_len);
@@ -82,27 +72,28 @@ void UdpReceiverImpl::receiveLoop() {
         ChannelState& channel = rx_channels_[mode];
         bool is_new_frame_started = false;
 
-        // ==========================================
-        // 步骤一：帧边界与丢包检测 (状态机核心)
-        // ==========================================
         if (!channel.slices.empty()) {
-            // 条件A: 收到 0 号包，说明新一帧开始了
             if (packet_idx == 0) is_new_frame_started = true;
-            // 条件B: 总包数变了，说明已经是下一张图的报文了
             else if (channel.expected_total != 0 && total_packets != channel.expected_total) is_new_frame_started = true;
-            // 条件C: 超时检测 (距离上次收到该通道的包超过 80ms)
             else if (now_ms() - channel.last_update_time > 80) is_new_frame_started = true;
         }
 
+        // 丢包兜底触发逻辑
         if (is_new_frame_started) {
-            std::cerr << "[Receiver] Packet loss detected for mode 0x" << std::hex << (int)mode << std::dec << "! Triggering fallback." << std::endl;
-            handleLostFrame(mode); // 触发黑屏兜底
+            std::cerr << "[Receiver] Packet loss detected for mode 0x" << std::hex << (int)mode << std::dec << ". Pushing fallback task." << std::endl;
+            
+            DecodeTask fallback_task;
+            fallback_task.win_mode = mode;
+            fallback_task.is_fallback = true;
+            
+            {
+                std::unique_lock<std::mutex> lock(queue_mutex_);
+                decode_queue_.push(std::move(fallback_task));
+                queue_cv_.notify_one();
+            }
             channel.slices.clear();
         }
 
-        // ==========================================
-        // 步骤二：存储当前切片
-        // ==========================================
         channel.expected_total = total_packets;
         channel.last_update_time = now_ms();
         
@@ -112,64 +103,96 @@ void UdpReceiverImpl::receiveLoop() {
         );
         channel.slices[packet_idx] = std::move(payload_data);
 
-        // ==========================================
-        // 步骤三：判断是否拼装完毕
-        // ==========================================
+        // ==== 一帧切片集齐，装车入库 ====
         if (channel.slices.size() == channel.expected_total) {
-            assembleAndDecode(mode, channel);
+            DecodeTask task;
+            task.win_mode = mode;
+            task.is_fallback = false;
+            
+            size_t total_size = 0;
+            for (const auto& pair : channel.slices) total_size += pair.second.size();
+            task.jpeg_buffer.reserve(total_size);
+            
+            for (const auto& pair : channel.slices) {
+                task.jpeg_buffer.insert(task.jpeg_buffer.end(), pair.second.begin(), pair.second.end());
+            }
+
+            {
+                std::unique_lock<std::mutex> lock(queue_mutex_);
+                // Tail Drop 策略：队列满时抛弃最新帧
+                if (decode_queue_.size() >= MAX_DECODE_QUEUE_SIZE) {
+                    std::cerr << "[Receiver] WARNING: Decode pipeline full! Dropping frame mode: 0x" 
+                              << std::hex << (int)mode << std::dec << std::endl;
+                } else {
+                    decode_queue_.push(std::move(task));
+                    queue_cv_.notify_one();
+                }
+            }
+            
             channel.slices.clear();
             channel.expected_total = 0;
         }
     }
 }
 
-void UdpReceiverImpl::assembleAndDecode(uint8_t win_mode, ChannelState& channel) {
-    // 1. 将所有切片拼接成一块连续内存
-    size_t total_size = 0;
-    for (const auto& pair : channel.slices) {
-        total_size += pair.second.size();
-    }
+// ==========================================
+// 线程 2：硬件解码与回调线程 (Consumer)
+// ==========================================
+void UdpReceiverImpl::decodeLoop() {
+    while (running_) {
+        DecodeTask task;
+        {
+            std::unique_lock<std::mutex> lock(queue_mutex_);
+            queue_cv_.wait(lock, [this]() { 
+                return !decode_queue_.empty() || !running_; 
+            });
 
-    std::vector<unsigned char> full_jpeg(total_size);
-    size_t offset = 0;
-    for (const auto& pair : channel.slices) {
-        std::memcpy(full_jpeg.data() + offset, pair.second.data(), pair.second.size());
-        offset += pair.second.size();
-    }
+            if (!running_ && decode_queue_.empty()) break;
 
-    // 2. 第一层解码：调用硬件库提取业务信息并剥离 APP15
-    unsigned char* stripped_jpeg = nullptr;
-    int stripped_jpeg_size = 0;
-    ::WinInfo hw_win;
-    std::vector<::Label> hw_labels;
+            task = std::move(decode_queue_.front());
+            decode_queue_.pop();
+        }
 
-    bool parse_success = decoder_->decode(full_jpeg.data(), total_size, &stripped_jpeg, stripped_jpeg_size, hw_labels, hw_win);
-
-    if (!parse_success || stripped_jpeg == nullptr || stripped_jpeg_size <= 0) {
-        std::cerr << "[Receiver] ImgDecode failed for mode 0x" << std::hex << (int)win_mode << std::dec << std::endl;
-        if (stripped_jpeg) delete[] stripped_jpeg;
-        handleLostFrame(win_mode);
-        return;
-    }
-
-    // 3. 第二层解码：利用 OpenCV 将纯净 JPEG 字节流还原为像素图 cv::Mat
-    std::vector<uchar> jpeg_buffer(stripped_jpeg, stripped_jpeg + stripped_jpeg_size);
-    cv::Mat img = cv::imdecode(jpeg_buffer, cv::IMREAD_GRAYSCALE); // 假设我们传的是灰度图
-    
-    delete[] stripped_jpeg; // 🚨 极其重要：释放硬件库 malloc 的内存
-
-    if (img.empty()) {
-        std::cerr << "[Receiver] OpenCV cv::imdecode failed!" << std::endl;
-        handleLostFrame(win_mode);
-        return;
-    }
-
-    // 4. 数据结构桥接转换 (原始类型 -> transport::) 并触发回调
-    if (callback_) {
         transport::DecodedFrame out_frame;
-        out_frame.image = img;
-        out_frame.is_valid = true;
 
+        // 处理兜底任务 (输出纯黑图片)
+        if (task.is_fallback) {
+            out_frame.is_valid = false;
+            out_frame.win_info.win_mode = task.win_mode;
+            out_frame.image = cv::Mat::zeros(fallback_height_, fallback_width_, CV_8UC1);
+            if (callback_) callback_(out_frame);
+            continue;
+        }
+
+        // 正常硬件解码流程
+        unsigned char* decoded_data = nullptr;
+        int decoded_size = 0;
+        ::WinInfo hw_win;
+        std::vector<::Label> hw_labels;
+
+        // 严格按照实际 SDK 的参数签名进行匹配调用
+        bool decode_ok = decoder_->decode(task.jpeg_buffer.data(), task.jpeg_buffer.size(), 
+                                          &decoded_data, decoded_size, hw_labels, hw_win);
+
+        if (!decode_ok || decoded_data == nullptr) {
+            std::cerr << "[Receiver] Hardware decode failed for mode: 0x" << std::hex << (int)task.win_mode << std::dec << std::endl;
+            out_frame.is_valid = false;
+            out_frame.win_info.win_mode = task.win_mode;
+            out_frame.image = cv::Mat::zeros(fallback_height_, fallback_width_, CV_8UC1);
+            if (callback_) callback_(out_frame);
+            continue;
+        }
+
+        // 裸数据指针封装转换
+        cv::Mat raw_img(fallback_height_, fallback_width_, CV_8UC1, decoded_data);
+        
+        out_frame.is_valid = true;
+        out_frame.image = raw_img.clone(); // 深拷贝出数据
+        
+        // 释放解码器申请的底层内存 (若 img_utils 内为 malloc，请将此处的 delete[] 改为 free)
+        free(decoded_data);
+        
+        // 装载业务数据
         out_frame.win_info.timestamp = hw_win.timestamp;
         out_frame.win_info.x         = hw_win.x;
         out_frame.win_info.y         = hw_win.y;
@@ -177,28 +200,26 @@ void UdpReceiverImpl::assembleAndDecode(uint8_t win_mode, ChannelState& channel)
         out_frame.win_info.win_mode  = hw_win.win_mode;
         out_frame.win_info.center_x  = hw_win.center_x;
         out_frame.win_info.center_y  = hw_win.center_y;
-        std::memcpy(out_frame.win_info.system_info, hw_win.system_info, sizeof(hw_win.system_info));
+        std::memcpy(out_frame.win_info.system_info, hw_win.system_info, sizeof(out_frame.win_info.system_info));
 
-        out_frame.labels.reserve(hw_labels.size());
-        for (const auto& lbl : hw_labels) {
-            out_frame.labels.push_back({lbl.id, lbl.x, lbl.y, lbl.w, lbl.h, lbl.conf, lbl.cls});
+        for (const auto& hl : hw_labels) {
+            out_frame.labels.push_back({hl.id, hl.x, hl.y, hl.w, hl.h, hl.conf, hl.cls});
         }
 
-        callback_(out_frame);
+        if (callback_) callback_(out_frame);
     }
 }
 
-void UdpReceiverImpl::handleLostFrame(uint8_t win_mode) {
-    if (!callback_) return;
-
-    transport::DecodedFrame err_frame;
-    // 生成一张长宽与预期一致的纯黑底图 (CV_8UC1 单通道黑图)
-    err_frame.image = cv::Mat::zeros(img_height_, img_width_, CV_8UC1);
-    err_frame.is_valid = false;
+void UdpReceiverImpl::stop() {
+    running_ = false;
+    queue_cv_.notify_all();
     
-    // 填充默认值，确保业务层知道是哪种类型发生了丢包
-    err_frame.win_info = {}; 
-    err_frame.win_info.win_mode = win_mode;
+    if (rx_thread_.joinable()) rx_thread_.join();
+    if (decode_thread_.joinable()) decode_thread_.join();
     
-    callback_(err_frame);
+    if (udp_server_) {
+        udp_server_->destory();
+        udp_server_.reset();
+    }
+    decoder_.reset();
 }

@@ -1,23 +1,31 @@
 #pragma once
 
 #include <memory>
+#include <vector>
+#include <map>
 #include <thread>
 #include <atomic>
-#include <map>
-#include <vector>
+#include <functional>
+#include <mutex>
+#include <condition_variable>
+#include <queue>
 
-// 1. 继承第一阶段定义的纯虚接口
 #include "../../include/ImageReceiver.h"
-
-// 2. 引入底层的网络和硬件编解码库
 #include "../network/udp_operation.h"
-#include "img_codec.h" 
+#include "img_codec.h"
 
-// 定义单个通道（某种 win_mode）的接收状态机
+// 内部流转的解码任务结构体
+struct DecodeTask {
+    uint8_t win_mode;
+    transport::WinInfo win_info;
+    std::vector<uint8_t> jpeg_buffer; 
+    bool is_fallback; // 标识是否为丢包触发的兜底(黑屏)任务
+};
+
 struct ChannelState {
-    std::map<uint16_t, std::vector<uint8_t>> slices; // 按包号缓存的切片数据
-    uint16_t expected_total = 0;                     // 该帧期望的总包数
-    uint64_t last_update_time = 0;                   // 最后一次收到包的时间戳(毫秒)，用于超时判定
+    uint16_t expected_total = 0;
+    std::map<uint16_t, std::vector<uint8_t>> slices;
+    int64_t last_update_time = 0;
 };
 
 class UdpReceiverImpl : public ImageReceiver {
@@ -25,34 +33,39 @@ public:
     UdpReceiverImpl();
     ~UdpReceiverImpl() override;
 
-    bool init(int local_port, int width, int height) override;
+    bool init(int local_port, int fallback_w, int fallback_h) override;
     void registerCallback(OnFrameReceivedCallback callback) override;
     void stop() override;
 
 private:
-    // 后台接收线程函数
+    // 线程 1：纯粹的极速网络收包与拼图线程
     void receiveLoop();
     
-    // 获取当前毫秒时间戳
-    uint64_t now_ms();
+    // 线程 2：专职的耗时硬件解码与业务回调线程
+    void decodeLoop();
 
-    // 核心动作：处理丢包，生成黑屏兜底数据并触发回调
-    void handleLostFrame(uint8_t win_mode);
-
-    // 核心动作：拼装完整载荷，调用两次解码，并触发回调
-    void assembleAndDecode(uint8_t win_mode, ChannelState& channel);
+    int64_t now_ms();
 
 private:
     std::unique_ptr<UDPOperation> udp_server_;
     std::unique_ptr<ImgDecode> decoder_;
     OnFrameReceivedCallback callback_;
 
-    int img_width_;
-    int img_height_;
+    std::atomic<bool> running_;
     
-    // 多通道独立重组缓冲区 (Key 为 win_mode)
+    // === 网络线程专用 ===
+    std::thread rx_thread_;
     std::map<uint8_t, ChannelState> rx_channels_;
 
-    std::thread rx_thread_;
-    std::atomic<bool> running_;
+    // === 异步解码流水线核心组件 ===
+    std::thread decode_thread_;
+    std::queue<DecodeTask> decode_queue_;
+    std::mutex queue_mutex_;
+    std::condition_variable queue_cv_;
+    
+    // 队列防爆上限：积压超过此值，执行 Tail Drop (丢弃新帧)
+    static constexpr size_t MAX_DECODE_QUEUE_SIZE = 50; 
+
+    int fallback_width_;
+    int fallback_height_;
 };
