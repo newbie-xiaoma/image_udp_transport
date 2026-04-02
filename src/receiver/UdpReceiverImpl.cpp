@@ -3,6 +3,10 @@
 #include <iostream>
 #include <chrono>
 #include <cstring>
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
+#include <unistd.h>
 
 UdpReceiverImpl::UdpReceiverImpl() 
     : running_(false), fallback_width_(1280), fallback_height_(1024) {
@@ -21,6 +25,7 @@ int64_t UdpReceiverImpl::now_ms() {
 bool UdpReceiverImpl::init(int local_port, int fallback_w, int fallback_h) {
     fallback_width_ = fallback_w;
     fallback_height_ = fallback_h;
+    local_port_ = local_port; // 记录监听端口
 
     udp_server_ = std::make_unique<UDPOperation>("0.0.0.0", local_port, "");
     if (!udp_server_->create_client()) {
@@ -35,11 +40,10 @@ bool UdpReceiverImpl::init(int local_port, int fallback_w, int fallback_h) {
     }
 
     running_ = true;
-    
     rx_thread_ = std::thread(&UdpReceiverImpl::receiveLoop, this);
     decode_thread_ = std::thread(&UdpReceiverImpl::decodeLoop, this);
 
-    std::cout << "[Receiver] Async Dual-Thread Pipeline Initialized. Listening on port: " << local_port << std::endl;
+    std::cout << "[Receiver] Pipeline Initialized. Listening on port: " << local_port << std::endl;
     return true;
 }
 
@@ -197,15 +201,29 @@ void UdpReceiverImpl::decodeLoop() {
 }
 
 void UdpReceiverImpl::stop() {
+    if (!running_) return; // 防止重复停止
     running_ = false;
+    
+    int sock = socket(AF_INET, SOCK_DGRAM, 0);
+    if (sock >= 0) {
+        struct sockaddr_in addr;
+        addr.sin_family = AF_INET;
+        addr.sin_port = htons(local_port_);
+        addr.sin_addr.s_addr = inet_addr("127.0.0.1");
+        char dummy_byte = 0;
+        sendto(sock, &dummy_byte, 1, 0, (struct sockaddr*)&addr, sizeof(addr));
+        close(sock);
+    }
+    
+    if (udp_server_) {
+        udp_server_->destory();
+    }
+    
     queue_cv_.notify_all();
     
     if (rx_thread_.joinable()) rx_thread_.join();
     if (decode_thread_.joinable()) decode_thread_.join();
     
-    if (udp_server_) {
-        udp_server_->destory();
-        udp_server_.reset();
-    }
+    udp_server_.reset();
     decoder_.reset();
 }

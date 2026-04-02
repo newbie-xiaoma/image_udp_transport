@@ -4,7 +4,7 @@
 #include <string>
 #include <vector>
 #include <atomic>
-#include <getopt.h> // 引入标准命令行解析库
+#include <getopt.h>
 #include <opencv2/opencv.hpp>
 
 #include "../src/sender/UdpSenderImpl.h"
@@ -12,88 +12,77 @@
 void print_help(const char* prog_name) {
     std::cout << "Usage: " << prog_name << " [options]\n"
               << "Options:\n"
-              << "  -h, --help       Show this help message and exit\n"
-              << "  -i, --ip         Target IP address (default: 127.0.0.1)\n"
+              << "  -h, --help       Show this help message\n"
+              << "  -i, --ip         Target IP (default: 127.0.0.1)\n"
               << "  -p, --port       Target Port (default: 8080)\n"
-              << "  -t, --time       Duration in seconds to run the test (default: 10)\n"
-              << "\nExample:\n"
-              << "  " << prog_name << " -i 192.168.1.100 -p 9000 -t 60\n";
+              << "  -t, --time       Duration in seconds (default: 60)\n"
+              << "  -m, --mode       Sensor Mode: 1=IR(50Hz), 2=TV(30Hz), 3=512(20Hz) (default: 1)\n";
 }
 
 int main(int argc, char* argv[]) {
-    // 默认参数
     std::string target_ip = "127.0.0.1";
     int target_port = 8080;
-    int duration_sec = 10;
+    int duration_sec = 60;
+    int mode_select = 1;
 
-    // 定义长短选项
-    const char* const short_opts = "hi:p:t:";
+    const char* const short_opts = "hi:p:t:m:";
     const option long_opts[] = {
         {"help", no_argument,       nullptr, 'h'},
         {"ip",   required_argument, nullptr, 'i'},
         {"port", required_argument, nullptr, 'p'},
         {"time", required_argument, nullptr, 't'},
+        {"mode", required_argument, nullptr, 'm'},
         {nullptr, no_argument,      nullptr, 0}
     };
 
     int opt;
     while ((opt = getopt_long(argc, argv, short_opts, long_opts, nullptr)) != -1) {
         switch (opt) {
-            case 'i':
-                target_ip = optarg;
-                break;
-            case 'p':
-                target_port = std::stoi(optarg);
-                break;
-            case 't':
-                duration_sec = std::stoi(optarg);
-                break;
-            case 'h':
-            case '?': // 遇到未知参数或未带值的参数，自动走这里
-            default:
-                print_help(argv[0]);
-                return 0;
+            case 'i': target_ip = optarg; break;
+            case 'p': target_port = std::stoi(optarg); break;
+            case 't': duration_sec = std::stoi(optarg); break;
+            case 'm': mode_select = std::stoi(optarg); break;
+            case 'h': default: print_help(argv[0]); return 0;
         }
     }
 
-    std::cout << "=== Sender Demo Started ===" << std::endl;
-    std::cout << "Target IP:   " << target_ip << std::endl;
-    std::cout << "Target Port: " << target_port << std::endl;
-    std::cout << "Duration:    " << duration_sec << " seconds\n" << std::endl;
+    uint8_t win_mode = 0x83;
+    int target_fps = 50;
+    std::string mode_name = "IR (0x83)";
+    std::string img_path = "data/1280.jpg";
 
-    // --- 加载素材 ---
-    cv::Mat img_1280 = cv::imread("data/1280.jpg", cv::IMREAD_GRAYSCALE);
-    cv::Mat img_512 = cv::imread("data/512.jpg", cv::IMREAD_GRAYSCALE);
-    
-    if (img_1280.empty() || img_512.empty()) {
-        std::cerr << "Failed to load test images from data/ directory!" << std::endl;
+    if (mode_select == 2) {
+        win_mode = 0x85; target_fps = 30; mode_name = "TV (0x85)"; img_path = "data/1280.jpg";
+    } else if (mode_select == 3) {
+        win_mode = 0x05; target_fps = 20; mode_name = "512 (0x05)"; img_path = "data/512.jpg";
+    }
+
+    std::cout << "=== Single-Channel Sender Demo ===" << std::endl;
+    std::cout << "Target: " << target_ip << ":" << target_port << " | Time: " << duration_sec << "s" << std::endl;
+    std::cout << "Mode:   " << mode_name << " @ " << target_fps << " FPS\n" << std::endl;
+
+    cv::Mat img = cv::imread(img_path, cv::IMREAD_GRAYSCALE);
+    if (img.empty()) {
+        std::cerr << "Failed to load image: " << img_path << std::endl;
         return -1;
     }
-    
-    if (img_1280.cols != 1280 || img_1280.rows != 1024) cv::resize(img_1280, img_1280, cv::Size(1280, 1024));
-    if (img_512.cols != 1280 || img_512.rows != 1024) cv::resize(img_512, img_512, cv::Size(1280, 1024));
+    if (img.cols != 1280 || img.rows != 1024) cv::resize(img, img, cv::Size(1280, 1024));
 
-    // --- 初始化发送引擎 ---
     UdpSenderImpl sender;
-    if (!sender.init(target_ip.c_str(), target_port, 1280, 1024)) {
-        std::cerr << "Sender init failed!" << std::endl;
-        return -1;
-    }
+    if (!sender.init(target_ip.c_str(), target_port, 1280, 1024)) return -1;
 
     std::atomic<bool> is_running{true};
 
-    // --- 传感器模拟闭包 ---
-    auto sensor_loop = [&](cv::Mat& img, uint8_t mode, int fps, const std::string& name) {
-        auto interval = std::chrono::microseconds(1000000 / fps);
+    auto sensor_loop = [&]() {
+        auto interval = std::chrono::microseconds(1000000 / target_fps);
         auto next_tick = std::chrono::steady_clock::now();
         uint32_t frame_cnt = 0;
         std::vector<transport::Label> dummy_labels = {{1, 100, 100, 50, 50, 0.9f, 0}};
 
         while (is_running) {
             transport::WinInfo win{};
-            win.win_mode = mode;
-            win.timestamp = std::chrono::duration_cast<std::chrono::milliseconds>(
-                std::chrono::steady_clock::now().time_since_epoch()).count();
+            win.win_mode = win_mode;
+            win.timestamp = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
             win.frame_id = frame_cnt++;
 
             sender.sendFrameAsync(img, win, dummy_labels, 80);
@@ -101,30 +90,19 @@ int main(int argc, char* argv[]) {
             next_tick += interval;
             std::this_thread::sleep_until(next_tick);
         }
-        std::cout << "[" << name << "] Stopped. Generated: " << frame_cnt << " frames." << std::endl;
+        std::cout << "\n[" << mode_name << "] Stopped. Total frames: " << frame_cnt << std::endl;
     };
 
-    std::cout << "--- Starting 3 Concurrent Sensor Threads ---" << std::endl;
-    std::cout << "  -> IR (0x83) @ 50Hz" << std::endl;
-    std::cout << "  -> TV (0x85) @ 30Hz" << std::endl;
-    std::cout << "  -> 512 (0x05) @ 20Hz\n" << std::endl;
+    std::thread worker_thread(sensor_loop);
 
-    std::thread ir_thread(sensor_loop, std::ref(img_1280), 0x83, 50, "IR_Camera");
-    std::thread tv_thread(sensor_loop, std::ref(img_1280), 0x85, 30, "TV_Camera");
-    std::thread w512_thread(sensor_loop, std::ref(img_512), 0x05, 20, "512_Camera");
-
-    // --- 倒计时 ---
     for (int i = duration_sec; i > 0; --i) {
         std::cout << "\rRunning... Time left: " << i << "s   " << std::flush;
         std::this_thread::sleep_for(std::chrono::seconds(1));
     }
-    std::cout << "\n\nTime is up! Stopping..." << std::endl;
+    std::cout << "\nTime is up! Stopping..." << std::endl;
 
     is_running = false;
-    ir_thread.join();
-    tv_thread.join();
-    w512_thread.join();
-
+    worker_thread.join();
     sender.stop();
     return 0;
 }
