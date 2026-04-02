@@ -64,7 +64,7 @@ private:
     std::condition_variable queue_cv_;
     
     // 队列防爆上限：积压超过此值，执行 Tail Drop (丢弃新帧)
-    static constexpr size_t MAX_DECODE_QUEUE_SIZE = 50; 
+    static constexpr size_t MAX_DECODE_QUEUE_SIZE = 10; 
 
     int fallback_width_;
     int fallback_height_;

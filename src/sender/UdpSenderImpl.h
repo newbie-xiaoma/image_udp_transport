@@ -12,7 +12,6 @@
 #include "../network/udp_operation.h"
 #include "img_codec.h" 
 
-// 异步任务包结构
 struct SendTask {
     cv::Mat img;
     transport::WinInfo win;
@@ -42,8 +41,6 @@ public:
 private:
     void sendLoop();
 
-    // 核心底层干活函数：硬件编码 + 分片发送
-    // 参数 apply_pacing 决定是否使用平滑控流算法
     bool internalEncodeAndSend(const cv::Mat& img, 
                                const transport::WinInfo& win, 
                                const std::vector<transport::Label>& labels, 
@@ -60,10 +57,8 @@ private:
 
     static constexpr size_t MAX_PAYLOAD_SIZE = 1024; 
 
-    // 硬件资源互斥锁：防止业务端同时调用 Sync 和 Async 导致底层 NPU Context 崩溃
     std::mutex hardware_mutex_;
 
-    // === 异步核心组件 ===
     std::queue<SendTask> task_queue_;
     std::mutex queue_mutex_;
     std::condition_variable queue_cv_;
@@ -71,5 +66,5 @@ private:
     std::thread worker_thread_;
     std::atomic<bool> running_;
     
-    static constexpr size_t MAX_QUEUE_SIZE = 3; 
+    static constexpr size_t MAX_QUEUE_SIZE = 50; 
 };

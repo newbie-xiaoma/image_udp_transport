@@ -22,14 +22,12 @@ bool UdpReceiverImpl::init(int local_port, int fallback_w, int fallback_h) {
     fallback_width_ = fallback_w;
     fallback_height_ = fallback_h;
 
-    // 创建 UDP 监听客户端
     udp_server_ = std::make_unique<UDPOperation>("0.0.0.0", local_port, "");
     if (!udp_server_->create_client()) {
         std::cerr << "[Receiver] Failed to bind local port " << local_port << std::endl;
         return false;
     }
 
-    // 初始化硬件解码器，直接通过构造函数传入分辨率参数
     decoder_ = std::make_unique<ImgDecode>(fallback_width_, fallback_height_);
     if (!decoder_) {
         std::cerr << "[Receiver] HW Decoder init failed!" << std::endl;
@@ -38,7 +36,6 @@ bool UdpReceiverImpl::init(int local_port, int fallback_w, int fallback_h) {
 
     running_ = true;
     
-    // 启动双线程流水线
     rx_thread_ = std::thread(&UdpReceiverImpl::receiveLoop, this);
     decode_thread_ = std::thread(&UdpReceiverImpl::decodeLoop, this);
 
@@ -46,14 +43,10 @@ bool UdpReceiverImpl::init(int local_port, int fallback_w, int fallback_h) {
     return true;
 }
 
-// 注意这里使用的是 OnFrameReceivedCallback
 void UdpReceiverImpl::registerCallback(OnFrameReceivedCallback callback) {
     callback_ = std::move(callback);
 }
 
-// ==========================================
-// 线程 1：极速网络收包线程 (Producer)
-// ==========================================
 void UdpReceiverImpl::receiveLoop() {
     char buffer[2048];
     while (running_) {
@@ -78,10 +71,7 @@ void UdpReceiverImpl::receiveLoop() {
             else if (now_ms() - channel.last_update_time > 80) is_new_frame_started = true;
         }
 
-        // 丢包兜底触发逻辑
         if (is_new_frame_started) {
-            std::cerr << "[Receiver] Packet loss detected for mode 0x" << std::hex << (int)mode << std::dec << ". Pushing fallback task." << std::endl;
-            
             DecodeTask fallback_task;
             fallback_task.win_mode = mode;
             fallback_task.is_fallback = true;
@@ -103,7 +93,6 @@ void UdpReceiverImpl::receiveLoop() {
         );
         channel.slices[packet_idx] = std::move(payload_data);
 
-        // ==== 一帧切片集齐，装车入库 ====
         if (channel.slices.size() == channel.expected_total) {
             DecodeTask task;
             task.win_mode = mode;
@@ -119,10 +108,8 @@ void UdpReceiverImpl::receiveLoop() {
 
             {
                 std::unique_lock<std::mutex> lock(queue_mutex_);
-                // Tail Drop 策略：队列满时抛弃最新帧
                 if (decode_queue_.size() >= MAX_DECODE_QUEUE_SIZE) {
-                    std::cerr << "[Receiver] WARNING: Decode pipeline full! Dropping frame mode: 0x" 
-                              << std::hex << (int)mode << std::dec << std::endl;
+                    // 队列满时静默丢弃最新帧，防止内存泄漏
                 } else {
                     decode_queue_.push(std::move(task));
                     queue_cv_.notify_one();
@@ -135,9 +122,6 @@ void UdpReceiverImpl::receiveLoop() {
     }
 }
 
-// ==========================================
-// 线程 2：硬件解码与回调线程 (Consumer)
-// ==========================================
 void UdpReceiverImpl::decodeLoop() {
     while (running_) {
         DecodeTask task;
@@ -155,7 +139,6 @@ void UdpReceiverImpl::decodeLoop() {
 
         transport::DecodedFrame out_frame;
 
-        // 处理兜底任务 (输出纯黑图片)
         if (task.is_fallback) {
             out_frame.is_valid = false;
             out_frame.win_info.win_mode = task.win_mode;
@@ -164,18 +147,15 @@ void UdpReceiverImpl::decodeLoop() {
             continue;
         }
 
-        // 正常硬件解码流程
         unsigned char* decoded_data = nullptr;
         int decoded_size = 0;
         ::WinInfo hw_win;
         std::vector<::Label> hw_labels;
 
-        // 严格按照实际 SDK 的参数签名进行匹配调用
         bool decode_ok = decoder_->decode(task.jpeg_buffer.data(), task.jpeg_buffer.size(), 
                                           &decoded_data, decoded_size, hw_labels, hw_win);
 
         if (!decode_ok || decoded_data == nullptr) {
-            std::cerr << "[Receiver] Hardware decode failed for mode: 0x" << std::hex << (int)task.win_mode << std::dec << std::endl;
             out_frame.is_valid = false;
             out_frame.win_info.win_mode = task.win_mode;
             out_frame.image = cv::Mat::zeros(fallback_height_, fallback_width_, CV_8UC1);
@@ -183,16 +163,22 @@ void UdpReceiverImpl::decodeLoop() {
             continue;
         }
 
-        // 裸数据指针封装转换
-        cv::Mat raw_img(fallback_height_, fallback_width_, CV_8UC1, decoded_data);
+        // === 关键修复：使用 OpenCV 解码底层吐出的纯净 JPEG 码流 ===
+        cv::Mat raw_jpeg(1, decoded_size, CV_8UC1, decoded_data);
+        cv::Mat decoded_img = cv::imdecode(raw_jpeg, cv::IMREAD_GRAYSCALE);
         
-        out_frame.is_valid = true;
-        out_frame.image = raw_img.clone(); // 深拷贝出数据
+        if (decoded_img.empty()) {
+            out_frame.is_valid = false;
+            out_frame.image = cv::Mat::zeros(fallback_height_, fallback_width_, CV_8UC1);
+        } else {
+            out_frame.is_valid = true;
+            out_frame.image = decoded_img; 
+        }
+
+        // 释放 img_utils 内部 new[] 出来的内存，绝对不能用 free！
+        delete[] decoded_data; 
         
-        // 释放解码器申请的底层内存 (若 img_utils 内为 malloc，请将此处的 delete[] 改为 free)
-        free(decoded_data);
-        
-        // 装载业务数据
+        // === 组装回调数据 ===
         out_frame.win_info.timestamp = hw_win.timestamp;
         out_frame.win_info.x         = hw_win.x;
         out_frame.win_info.y         = hw_win.y;
