@@ -38,9 +38,7 @@ bool UdpSenderImpl::init(const char* remote_ip, int remote_port, int width, int 
     return true;
 }
 
-// ==========================================
-// 1. 同步接口实现
-// ==========================================
+
 bool UdpSenderImpl::sendFrameSync(const cv::Mat& img, 
                                   const transport::WinInfo& win, 
                                   const std::vector<transport::Label>& labels, 
@@ -50,9 +48,7 @@ bool UdpSenderImpl::sendFrameSync(const cv::Mat& img,
     return internalEncodeAndSend(img, win, labels, quality, false);
 }
 
-// ==========================================
-// 2. 异步接口实现
-// ==========================================
+
 bool UdpSenderImpl::sendFrameAsync(const cv::Mat& img, 
                                    const transport::WinInfo& win, 
                                    const std::vector<transport::Label>& labels, 
@@ -78,9 +74,7 @@ bool UdpSenderImpl::sendFrameAsync(const cv::Mat& img,
     return true;
 }
 
-// ==========================================
-// 3. 异步后台线程循环
-// ==========================================
+
 void UdpSenderImpl::sendLoop() {
     while (running_) {
         SendTask task;
@@ -100,9 +94,7 @@ void UdpSenderImpl::sendLoop() {
     }
 }
 
-// ==========================================
-// 4. 核心底层发送引擎 (供 Sync 和 Async 复用)
-// ==========================================
+
 bool UdpSenderImpl::internalEncodeAndSend(const cv::Mat& img, 
                                           const transport::WinInfo& win, 
                                           const std::vector<transport::Label>& labels, 

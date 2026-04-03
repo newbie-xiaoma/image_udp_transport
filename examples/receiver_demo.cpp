@@ -36,10 +36,6 @@ std::string getModeName(uint8_t mode) {
     if (mode == 0x05) return "512(0x05)";
     return "Unknown  ";
 }
-
-// ========================================================
-// 🌟 异步存图任务队列组件
-// ========================================================
 struct SaveTask {
     std::string filepath;
     cv::Mat image;
@@ -113,7 +109,6 @@ int main(int argc, char* argv[]) {
         if (frame.is_valid) {
             frame_counters[frame.win_info.win_mode]++;
             
-            // 🌟 构造存图任务，扔给后台磁盘线程
             std::string filename = "saved_frames/mode_" + std::to_string(frame.win_info.win_mode) 
                                  + "_f" + std::to_string(frame.win_info.frame_id) + ".jpg";
             
